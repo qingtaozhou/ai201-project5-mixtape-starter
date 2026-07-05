@@ -50,7 +50,7 @@ Routes mainly parse path/query/JSON input, reject missing fields, call one servi
 - `tests/test_streaks.py` checks new, same-day, consecutive-day, skipped-day, and weekend streak behavior.
 - `tests/test_feed.py` checks both sides of the one-hour “listening now” boundary and confirms that the general activity feed remains unfiltered by age.
 - `tests/test_search.py` checks matching, no-match results, and songs with zero, one, or several tags.
-- `tests/test_playlists.py` checks complete ordered playlist retrieval and empty playlists.
+- `tests/test_playlists.py` checks complete ordered playlist retrieval and the zero-, one-, and five-song boundaries.
 
 Each test module creates an isolated in-memory SQLite application using `create_app()` configuration overrides. The tests call service functions directly, which keeps them focused on business logic rather than HTTP transport.
 
@@ -138,26 +138,26 @@ I then made the boundary precise in `tests/test_feed.py`: one friend had an even
 
 ### Issue #5 — Last playlist song is missing
 
-**How I reproduced it:** I used the existing playlist fixture, which creates one playlist with five songs named `Track 1` through `Track 5`. Each song is inserted into `playlist_entries` with positions 1 through 5. I called `get_playlist_songs(playlist.id)` and inspected both its length and ordered titles.
-
-**Expected:** The service should return five songs in this order: `Track 1`, `Track 2`, `Track 3`, `Track 4`, `Track 5`.
-
-**Actual:** It returned only four songs: `Track 1`, `Track 2`, `Track 3`, and `Track 4`. `Track 5`, the final positioned entry, was absent.
-
-**Reproduction command:**
+**How I reproduced it:** Before changing `playlist_service.py`, I ran the existing playlist tests. Their fixture inserts five songs named `Track 1` through `Track 5` into `playlist_entries` at positions 1 through 5. Calling `get_playlist_songs()` returned a count of 4 and the titles `Track 1` through `Track 4`; `Track 5` was absent. I then added a one-song boundary test. A playlist containing only `Only Track` returned an empty list rather than that song. The existing empty-playlist test still passed.
 
 ```bash
-.venv/bin/python -m pytest \
-  tests/test_playlists.py::test_playlist_returns_all_songs \
-  tests/test_playlists.py::test_playlist_returns_songs_in_order -q
+.venv/bin/python -m pytest tests/test_playlists.py -v
 ```
 
-**Result:** Both tests fail consistently on the unchanged starter code: the count is 4 instead of 5, and the ordered title list lacks `Track 5`.
+Before the fix, the results were three failures and one pass: both five-song assertions and the one-song assertion failed, while the empty-playlist assertion passed.
 
-Issues #1 and #2 are fixed. Issue #5 remains unchanged for its separate investigation pass.
+**How I found the root cause:** I traced the read path from `GET /playlists/<playlist_id>/songs` in `routes/playlists.py`. The route calls `get_playlist_songs()` and calculates its response count directly from the returned list, so it does not remove any songs itself. In `services/playlist_service.py`, I followed the query through its join to `playlist_entries`, its playlist-ID filter, and its ascending `position` ordering. In `models.py`, I confirmed that `playlist_entries` stores each playlist/song pair and its explicit position. The test fixture confirmed all five rows were inserted. The decisive point came after the query: the return expression serialized `songs[:-1]`. Comparing that with the function's promise to return all songs showed that the final row was deliberately sliced away after a correct query.
+
+**The root cause:** In Python, `songs[:-1]` creates a list starting at the beginning and stopping before index `-1`, which is the final element. Therefore, `get_playlist_songs()` always discarded exactly one valid song after loading and ordering the database results. Five query rows became four, and one row became zero. An empty list still produced an empty list, which explains why that boundary did not expose the defect.
+
+**My fix and side-effect check:** I changed only the list comprehension input from `songs[:-1]` to `songs`. The SQL join, playlist filter, position ordering, and `Song.to_dict()` serialization are unchanged. The playlist suite now passes all four cases: five songs are complete and ordered, an empty playlist remains empty, and a one-song playlist returns its only entry. I then ran the full project suite, and all 16 tests passed.
+
+Issues #1, #2, and #5 are fixed.
 
 ## AI Usage
 
 For Issue #1, I used AI after tracing the route and service myself. I asked it to explain the meaning of `today.weekday() != 6` and used that explanation to check Python's weekday numbering. I verified the answer directly with controlled `date` values and the existing Sunday test before editing code. AI helped explain the suspicious condition; the call-chain reading and executable test established the diagnosis.
 
 For Issue #2, I used AI after locating `get_friends_listening_now()` to enumerate boundary cases for its time filter and to compare its structure with `get_activity_feed()`. This helped identify useful checks just inside and outside one hour and the need to preserve the unfiltered activity feed. I verified the diagnosis with controlled 59- and 61-minute database records before changing the threshold.
+
+For Issue #5, I used AI after locating the `songs[:-1]` return expression to explain Python's negative-index slice behavior and suggest edge cases. I verified that explanation with the existing five-song fixture and a new one-song test before changing the service. The tests proved the query returned usable data and that the loss happened during slicing.

@@ -84,3 +84,29 @@ def test_empty_playlist_returns_empty_list(app):
 
         songs = get_playlist_songs(playlist.id)
         assert songs == []
+
+
+def test_single_song_playlist_returns_its_song(app):
+    """A one-song playlist should not be mistaken for an empty playlist."""
+    with app.app_context():
+        user = User(username="solo", email="solo@example.com")
+        db.session.add(user)
+        db.session.flush()
+
+        song = Song(title="Only Track", artist="Solo Artist", shared_by=user.id)
+        playlist = Playlist(name="One Song", created_by=user.id)
+        db.session.add_all([song, playlist])
+        db.session.flush()
+
+        db.session.execute(
+            playlist_entries.insert().values(
+                playlist_id=playlist.id,
+                song_id=song.id,
+                position=1,
+                added_by=user.id,
+            )
+        )
+        db.session.commit()
+
+        songs = get_playlist_songs(playlist.id)
+        assert [item["title"] for item in songs] == ["Only Track"]
