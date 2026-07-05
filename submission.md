@@ -49,6 +49,7 @@ Routes mainly parse path/query/JSON input, reject missing fields, call one servi
 
 - `tests/test_streaks.py` checks new, same-day, consecutive-day, skipped-day, and weekend streak behavior.
 - `tests/test_feed.py` checks both sides of the one-hour “listening now” boundary and confirms that the general activity feed remains unfiltered by age.
+- `tests/test_notifications.py` checks that another user's rating notifies the song sharer while a self-rating does not.
 - `tests/test_search.py` checks matching, no-match results, and songs with zero, one, or several tags.
 - `tests/test_playlists.py` checks complete ordered playlist retrieval and the zero-, one-, and five-song boundaries.
 
@@ -136,6 +137,38 @@ I then made the boundary precise in `tests/test_feed.py`: one friend had an even
 
 **My fix and side-effect check:** I changed only `RECENT_THRESHOLD` from `timedelta(hours=24)` to `timedelta(hours=1)`. The query structure, friend filtering, ordering, and deduplication remain unchanged. I added one regression test proving that a 59-minute event is included while a 61-minute event is excluded, covering both sides of the boundary. A second test proves that `get_activity_feed()` still returns both events because that separate feature is intentionally not time-filtered. Both feed tests pass. The full suite reports 13 passing tests, with only the two tests for the separate, still-unfixed playlist issue failing.
 
+### Issue #3 — The same song appears more than once in search
+
+**How I reproduced it:** I used the seeded `Crown Heights Anthem`, which has three tags, and executed the statement built by the original search query directly. The database returned three rows carrying the same song ID—one row for each matching `song_tags` association. In this installed SQLAlchemy version, `Query.all()` identity-deduplicated those rows into one `Song` object, so the existing API-level duplicate test passed. I recorded that limitation rather than claiming a visible failure that did not occur locally. The underlying query shape still reproduced the reported version-dependent failure condition:
+
+```text
+database rows: 3
+database song ids: [same ID, same ID, same ID]
+ORM entity results: 1
+```
+
+**How I found the root cause:** I started at `GET /songs/search` in `routes/songs.py`. The route validates `q`, calls `search_songs()`, and returns its list unchanged. In `services/search_service.py`, I followed the query from `Song` through an outer join to `song_tags`, followed by title/artist filtering and serialization through `Song.to_dict()`. In `models.py`, I confirmed that `song_tags` is a many-to-many association and that `Song.tags` is loaded separately by the relationship. In `tests/test_search.py`, the key fixture assigns three tags to one song. Executing the query statement directly made the cause conclusive: the join produced three physical result rows for that one song before ORM identity handling.
+
+**The root cause:** A relational join returns one row for every matching pair. Because the search query outer-joined songs to `song_tags` without `DISTINCT`, a song with three tags produced three rows containing the same song columns. Whether those became duplicate API entries depended on ORM result uniquing, which explains the inconsistent symptom across environments. The database query itself did not guarantee the service's contract of one result per song.
+
+**My fix and side-effect check:** I added `.distinct()` to the search query before `.all()`, making uniqueness explicit at the SQL layer. After the change, direct execution returns one database row for the three-tag song rather than three. All five search tests pass: title/artist matching, no-match behavior, and songs with zero, one, or multiple tags. The outer join remains, so songs without tags are still returned, and `Song.to_dict()` still includes all associated tag names.
+
+### Issue #4 — Ratings do not notify the song sharer
+
+**How I reproduced it:** Before changing `notification_service.py`, I created an isolated in-memory database with a song sharer, a different user, and one shared song. I called `rate_song(friend_id, song_id, 5)`, then queried `Notification`. The rating was saved, but the notification list was empty, so the expected count of 1 failed with an actual count of 0. I also rated the song as its own sharer and confirmed that this correctly produced no notification.
+
+```bash
+.venv/bin/python -m pytest tests/test_notifications.py -v
+```
+
+Before the fix, the friend-rating test failed and the self-rating test passed.
+
+**How I found the root cause:** I started at `POST /songs/<song_id>/rate` in `routes/songs.py`. The route parses `user_id` and `score`, calls `notification_service.rate_song()`, and returns the resulting `Rating`, so it contains no notification behavior. I followed `rate_song()` through score validation, loading the `Song` and `User`, finding or creating the user's unique `Rating`, and committing it. I checked `models.py` to confirm that `Rating` and `Notification` are separate records and that `Song.shared_by` identifies the intended recipient. I then compared this function with `add_to_playlist()` in the same service—the working interaction path mentioned in the issue. `add_to_playlist()` conditionally calls `create_notification()` for the song's sharer after its database update; `rate_song()` simply returned after committing. That missing parallel step was the exact structural difference.
+
+**The root cause:** `rate_song()` implemented rating persistence but never created a `Notification`. It had already loaded every required value—the song's original sharer, the rater's username, the song title, and the score—but after committing the rating it returned immediately. Consequently, no `song_rated` notification record existed for the user-notifications endpoint to retrieve.
+
+**My fix and side-effect check:** After committing the rating, I added the same recipient guard used by playlist notifications: if `song.shared_by != user_id`, call `create_notification()` for the sharer with type `song_rated` and a body containing the rater, song title, and score. This prevents self-notifications without changing score validation or rating upsert behavior. The new tests confirm that a friend's rating creates exactly one notification for the correct recipient and a self-rating creates zero. The full project suite passes all 18 tests.
+
 ### Issue #5 — Last playlist song is missing
 
 **How I reproduced it:** Before changing `playlist_service.py`, I ran the existing playlist tests. Their fixture inserts five songs named `Track 1` through `Track 5` into `playlist_entries` at positions 1 through 5. Calling `get_playlist_songs()` returned a count of 4 and the titles `Track 1` through `Track 4`; `Track 5` was absent. I then added a one-song boundary test. A playlist containing only `Only Track` returned an empty list rather than that song. The existing empty-playlist test still passed.
@@ -152,12 +185,16 @@ Before the fix, the results were three failures and one pass: both five-song ass
 
 **My fix and side-effect check:** I changed only the list comprehension input from `songs[:-1]` to `songs`. The SQL join, playlist filter, position ordering, and `Song.to_dict()` serialization are unchanged. The playlist suite now passes all four cases: five songs are complete and ordered, an empty playlist remains empty, and a one-song playlist returns its only entry. I then ran the full project suite, and all 16 tests passed.
 
-Issues #1, #2, and #5 are fixed.
+Issues #1 through #5 are fixed.
 
 ## AI Usage
 
 For Issue #1, I used AI after tracing the route and service myself. I asked it to explain the meaning of `today.weekday() != 6` and used that explanation to check Python's weekday numbering. I verified the answer directly with controlled `date` values and the existing Sunday test before editing code. AI helped explain the suspicious condition; the call-chain reading and executable test established the diagnosis.
 
 For Issue #2, I used AI after locating `get_friends_listening_now()` to enumerate boundary cases for its time filter and to compare its structure with `get_activity_feed()`. This helped identify useful checks just inside and outside one hour and the need to preserve the unfiltered activity feed. I verified the diagnosis with controlled 59- and 61-minute database records before changing the threshold.
+
+For Issue #3, I used AI after locating the outer join to explain how a many-to-many join multiplies rows and why SQLAlchemy entity identity handling can hide duplicates. I verified that explanation by executing the generated SQL statement directly before and after adding `DISTINCT`; the database row count changed from three to one.
+
+For Issue #4, I used AI after reading both `rate_song()` and `add_to_playlist()` to compare their control flow. It highlighted the missing notification side effect after the rating commit and suggested checking the self-interaction boundary. I verified the difference in the source and with isolated tests for a friend's rating and a self-rating before implementing the matching guarded notification call.
 
 For Issue #5, I used AI after locating the `songs[:-1]` return expression to explain Python's negative-index slice behavior and suggest edge cases. I verified that explanation with the existing five-song fixture and a new one-song test before changing the service. The tests proved the query returned usable data and that the loss happened during slicing.
